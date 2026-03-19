@@ -11,7 +11,14 @@ import {
 } from "./guardrails.js";
 import { createDefaultState, createPlanFilePath, createPlanStateEntry, restoreStateFromSession, type PlanSessionState } from "./state.js";
 import { loadToolDocs } from "./tool-docs.js";
-import { askUserQuestion, confirmEnterPlanMode, confirmExitPlanMode, notifyWarnings, updatePlanModeUi } from "./ui.js";
+import {
+	askUserQuestion,
+	confirmEnterPlanMode,
+	confirmExitPlanMode,
+	getAtomicQuestionViolation,
+	notifyWarnings,
+	updatePlanModeUi,
+} from "./ui.js";
 
 const ENTER_PLAN_MODE_PARAMS = Type.Object({
 	reason: Type.Optional(Type.String({ description: "Why planning is needed before implementation" })),
@@ -209,11 +216,20 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 		promptGuidelines: [
 			"Use ask_user_question when user input is genuinely needed to resolve ambiguity or make a meaningful decision.",
 			"Do not ask questions that can be answered by inspecting the repository or current context.",
+			"Ask only one atomic question per tool call; if multiple decisions are unresolved, ask them in separate calls.",
+			"Keep the question short, keep extra detail in context, and keep answer options concise and distinct.",
 		],
 		parameters: ASK_USER_QUESTION_PARAMS,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const fullQuestion = params.context ? `${params.question}\n\n${params.context}` : params.question;
-			const answer = await askUserQuestion(ctx, fullQuestion, params.options);
+			const questionViolation = getAtomicQuestionViolation(params.question);
+			if (questionViolation) {
+				return {
+					content: [{ type: "text", text: questionViolation }],
+					details: { ok: false, answer: null, reason: "non_atomic_question" },
+				};
+			}
+
+			const answer = await askUserQuestion(ctx, params.question, params.context, params.options);
 
 			if (!answer) {
 				return {
