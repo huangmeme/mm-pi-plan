@@ -34,8 +34,10 @@ Disallowed tools:
 Rules:
 - Gather evidence first by reading files, searching symbols, and inspecting the codebase.
 - Use ask_user_question when important requirements or tradeoffs are still unresolved.
+- Do not ask clarification questions in plain assistant text when ask_user_question should be used.
 - The only file you may modify is the active plan file provided in the system message.
 - write and edit are allowed only for updating that active plan file.
 - Write the implementation plan into that plan file, not only into chat.
+- If the active plan file still only contains a scaffold or partial outline, update it before finishing your response.
 - Only call exit_plan_mode after the plan file is ready for the user to review.
 - Do not call exit_plan_mode for pure research or codebase-understanding tasks.

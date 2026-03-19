@@ -51,6 +51,18 @@ async function readPlanFile(planFilePath: string): Promise<string> {
 	return readFile(planFilePath, "utf-8");
 }
 
+function buildPlanningInstructionMessage(planFilePath: string): string {
+	return [
+		`Plan mode is active.`,
+		`Active plan file: ${planFilePath}`,
+		`Next actions:`,
+		`1. Gather evidence with read/search tools as needed.`,
+		`2. Write or update the implementation plan in the active plan file before finishing your response.`,
+		`3. Do not keep the real plan only in chat.`,
+		`4. Only call exit_plan_mode after the active plan file is genuinely ready for user review.`,
+	].join("\n");
+}
+
 function getAllToolNames(pi: ExtensionAPI): string[] {
 	return pi.getAllTools().map((tool) => tool.name);
 }
@@ -87,7 +99,7 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 			updatePlanModeUi(ctx, state);
 			return {
 				ok: true,
-				message: `Plan mode is already active. Current plan file: ${state.planFilePath}`,
+				message: buildPlanningInstructionMessage(state.planFilePath),
 			};
 		}
 
@@ -112,7 +124,7 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 
 		return {
 			ok: true,
-			message: `Plan mode enabled. Write the plan to ${planFilePath}.`,
+			message: buildPlanningInstructionMessage(planFilePath),
 		};
 	}
 
@@ -137,6 +149,11 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 		name: "enter_plan_mode",
 		label: "enter_plan_mode",
 		description: docs.enter_plan_mode,
+		promptSnippet:
+			"enter_plan_mode: request approval to switch into planning mode before implementing a complex coding task.",
+		promptGuidelines: [
+			"After enter_plan_mode succeeds, treat the active plan file as the source of truth and update it before finishing your response.",
+		],
 		parameters: ENTER_PLAN_MODE_PARAMS,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const result = await enterPlanMode(ctx, {
@@ -159,6 +176,12 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 		name: "exit_plan_mode",
 		label: "exit_plan_mode",
 		description: docs.exit_plan_mode,
+		promptSnippet:
+			"exit_plan_mode: request approval to leave planning mode only after the active plan file is ready for user review.",
+		promptGuidelines: [
+			"Do not call exit_plan_mode until the active plan file contains a meaningful implementation plan.",
+			"If anything important is still unresolved, use ask_user_question first and continue refining the active plan file.",
+		],
 		parameters: EXIT_PLAN_MODE_PARAMS,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			if (state.mode !== "planning" || !state.planFilePath) {
@@ -218,6 +241,7 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 			"Do not ask questions that can be answered by inspecting the repository or current context.",
 			"Ask only one atomic question per tool call; if multiple decisions are unresolved, ask them in separate calls.",
 			"Keep the question short, keep extra detail in context, and keep answer options concise and distinct.",
+			"In plan mode, do not ask clarification questions in plain assistant text; use ask_user_question.",
 		],
 		parameters: ASK_USER_QUESTION_PARAMS,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -295,7 +319,19 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 			return;
 		}
 
-		const planPrompt = `${planModePrompt}\n\nCurrent plan file: ${state.planFilePath}`;
+		let extraReminder = "";
+		try {
+			const currentPlan = await readPlanFile(state.planFilePath);
+			if (!isValidPlanFileContent(currentPlan)) {
+				extraReminder =
+					"\n\nReminder: the active plan file still does not contain a meaningful plan. Update the active plan file during this run before finishing your response.";
+			}
+		} catch {
+			extraReminder =
+				"\n\nReminder: the active plan file is missing or unreadable. Recreate or update it before finishing your response.";
+		}
+
+		const planPrompt = `${planModePrompt}\n\nCurrent plan file: ${state.planFilePath}${extraReminder}`;
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${planPrompt}`,
 		};

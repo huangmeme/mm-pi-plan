@@ -12,6 +12,7 @@ Behavior:
 - If the user approves, the session switches into Plan Mode.
 - A new active plan file is created for the current planning session.
 - After entering Plan Mode, planning work should be written into that active plan file.
+- After entering Plan Mode, do not keep the real plan only in chat.
 
 Use this tool when:
 - The task will require writing or changing code.
@@ -26,3 +27,4 @@ Do not use this tool when:
 Requirements:
 - Prefer this tool when the task has meaningful implementation risk or ambiguity.
 - After entering Plan Mode, follow the Plan Mode rules from the system prompt and plan file workflow.
+- After this tool succeeds, update the active plan file before finishing the response.
