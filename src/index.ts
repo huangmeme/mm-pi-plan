@@ -1,15 +1,24 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, InputEvent, ToolResultEvent } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import {
 	getPlanModeToolNames,
+	isSamePlanFilePath,
 	getToolPath,
 	isPlanFileWriteAllowed,
-	isValidPlanFileContent,
 	isWriteLikeTool,
 } from "./guardrails.js";
-import { createDefaultState, createPlanFilePath, createPlanStateEntry, restoreStateFromSession, type PlanSessionState } from "./state.js";
+import { analyzePlanFileContent, createPlanScaffold, injectTaskSummaryIntoPlanContent } from "./plan-file.js";
+import { buildPlanModeIntroText } from "./planning-context.js";
+import {
+	createDefaultState,
+	createPlanFilePath,
+	createPlanStateEntry,
+	getPlanDisplayStatus,
+	restoreStateFromSession,
+	type PlanSessionState,
+} from "./state.js";
 import { loadToolDocs } from "./tool-docs.js";
 import {
 	askUserQuestion,
@@ -37,29 +46,58 @@ const ASK_USER_QUESTION_PARAMS = Type.Object({
 	),
 });
 
-async function ensurePlanFileExists(planFilePath: string): Promise<void> {
-	await mkdir(dirname(planFilePath), { recursive: true });
-	try {
-		await access(planFilePath);
-	} catch {
-		const initialContent = `# Implementation Plan\n\n## Goal\n\n## Evidence\n\n## Proposed Steps\n`;
-		await writeFile(planFilePath, initialContent, "utf-8");
-	}
+const DIRTY_EVIDENCE_TOOLS = new Set([
+	"read",
+	"grep",
+	"find",
+	"ls",
+	"lsp",
+	"ast_search",
+	"web_search",
+	"fetch_content",
+	"get_search_content",
+]);
+
+function normalizeTaskSummary(taskSummary?: string): string | undefined {
+	const normalized = taskSummary?.trim();
+	return normalized && normalized.length > 0 ? normalized : undefined;
 }
 
 async function readPlanFile(planFilePath: string): Promise<string> {
 	return readFile(planFilePath, "utf-8");
 }
 
-function buildPlanningInstructionMessage(planFilePath: string): string {
+async function ensurePlanFileExists(planFilePath: string, taskSummary?: string): Promise<string> {
+	await mkdir(dirname(planFilePath), { recursive: true });
+	const normalizedTaskSummary = normalizeTaskSummary(taskSummary);
+
+	try {
+		await access(planFilePath);
+		const currentContent = await readPlanFile(planFilePath);
+		if (!normalizedTaskSummary) {
+			return currentContent;
+		}
+
+		const updatedContent = injectTaskSummaryIntoPlanContent(currentContent, normalizedTaskSummary);
+		if (updatedContent !== currentContent) {
+			await writeFile(planFilePath, updatedContent, "utf-8");
+			return updatedContent;
+		}
+
+		return currentContent;
+	} catch {
+		const initialContent = createPlanScaffold(normalizedTaskSummary);
+		await writeFile(planFilePath, initialContent, "utf-8");
+		return initialContent;
+	}
+}
+
+function buildPlanningInstructionMessage(planFilePath: string, taskSummary?: string): string {
 	return [
-		`Plan mode is active.`,
+		"Plan mode is active.",
 		`Active plan file: ${planFilePath}`,
-		`Next actions:`,
-		`1. Gather evidence with read/search tools as needed.`,
-		`2. Write or update the implementation plan in the active plan file before finishing your response.`,
-		`3. Do not keep the real plan only in chat.`,
-		`4. Only call exit_plan_mode after the active plan file is genuinely ready for user review.`,
+		taskSummary ? `Task summary: ${taskSummary}` : "Task summary: waiting for the next real user task prompt.",
+		"Only update the active plan file while plan mode is active.",
 	].join("\n");
 }
 
@@ -78,6 +116,55 @@ function getNormalTools(pi: ExtensionAPI, restoreTools: string[] | null): string
 	return getAllToolNames(pi);
 }
 
+function describeEvidenceSource(toolName: string, input: unknown): string {
+	const path = getToolPath(input);
+	if (path) {
+		return `${toolName}: ${path}`;
+	}
+
+	if (typeof input !== "object" || input === null) {
+		return toolName;
+	}
+
+	const candidate = input as {
+		pattern?: unknown;
+		query?: unknown;
+		q?: unknown;
+		url?: unknown;
+		symbol?: unknown;
+	};
+
+	if (typeof candidate.pattern === "string" && candidate.pattern.trim().length > 0) {
+		return `${toolName}: ${candidate.pattern.trim()}`;
+	}
+	if (typeof candidate.query === "string" && candidate.query.trim().length > 0) {
+		return `${toolName}: ${candidate.query.trim()}`;
+	}
+	if (typeof candidate.q === "string" && candidate.q.trim().length > 0) {
+		return `${toolName}: ${candidate.q.trim()}`;
+	}
+	if (typeof candidate.url === "string" && candidate.url.trim().length > 0) {
+		return `${toolName}: ${candidate.url.trim()}`;
+	}
+	if (typeof candidate.symbol === "string" && candidate.symbol.trim().length > 0) {
+		return `${toolName}: ${candidate.symbol.trim()}`;
+	}
+
+	return toolName;
+}
+
+function statesEqual(left: PlanSessionState, right: PlanSessionState): boolean {
+	return (
+		left.mode === right.mode &&
+		left.planFilePath === right.planFilePath &&
+		left.taskSummary === right.taskSummary &&
+		left.planStatus === right.planStatus &&
+		left.planNeedsSync === right.planNeedsSync &&
+		left.lastPlanHash === right.lastPlanHash &&
+		left.lastEvidenceSource === right.lastEvidenceSource
+	);
+}
+
 function persistState(pi: ExtensionAPI, state: PlanSessionState): void {
 	pi.appendEntry("pi-plan-state", createPlanStateEntry(state));
 }
@@ -86,8 +173,106 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 	const { docs, planModePrompt, warnings } = await loadToolDocs();
 	let state = createDefaultState();
 	let restoreTools: string[] | null = null;
+	let planningIntroPending = false;
 
-	async function enterPlanMode(
+	const commitState = (ctx: ExtensionContext | undefined, nextState: PlanSessionState) => {
+		if (statesEqual(state, nextState)) {
+			return;
+		}
+
+		state = nextState;
+		persistState(pi, state);
+		if (ctx) {
+			updatePlanModeUi(ctx, state);
+		}
+	};
+
+	const markPlanDirty = (ctx: ExtensionContext | undefined, source: string) => {
+		if (state.mode !== "planning") {
+			return;
+		}
+
+		commitState(ctx, {
+			...state,
+			planNeedsSync: true,
+			lastEvidenceSource: source,
+		});
+	};
+
+	const syncPlanStateFromContent = (
+		ctx: ExtensionContext | undefined,
+		content: string,
+		options: { clearDirtyOnChange?: boolean } = {},
+	): string => {
+		const analysis = analyzePlanFileContent(content);
+		const planChanged = analysis.hash !== state.lastPlanHash;
+		const clearDirty = options.clearDirtyOnChange === true && planChanged;
+
+		commitState(ctx, {
+			...state,
+			planStatus: analysis.status,
+			lastPlanHash: analysis.hash,
+			planNeedsSync: clearDirty ? false : state.planNeedsSync,
+			lastEvidenceSource: clearDirty ? undefined : state.lastEvidenceSource,
+		});
+
+		return content;
+	};
+
+	const refreshPlanStateFromFile = async (
+		ctx: ExtensionContext | undefined,
+		options: { clearDirtyOnChange?: boolean } = {},
+	): Promise<string | undefined> => {
+		if (state.mode !== "planning" || !state.planFilePath) {
+			return undefined;
+		}
+
+		try {
+			const planContent = await readPlanFile(state.planFilePath);
+			return syncPlanStateFromContent(ctx, planContent, options);
+		} catch {
+			commitState(ctx, {
+				...state,
+				planStatus: "empty",
+				lastPlanHash: undefined,
+			});
+			return undefined;
+		}
+	};
+
+	const seedTaskSummary = async (ctx: ExtensionContext | undefined, taskSummary: string): Promise<void> => {
+		if (state.mode !== "planning" || !state.planFilePath) {
+			return;
+		}
+
+		const normalizedTaskSummary = normalizeTaskSummary(taskSummary);
+		if (!normalizedTaskSummary) {
+			return;
+		}
+
+		const currentContent = await ensurePlanFileExists(state.planFilePath, normalizedTaskSummary);
+		commitState(ctx, {
+			...state,
+			taskSummary: normalizedTaskSummary,
+		});
+		syncPlanStateFromContent(ctx, currentContent, { clearDirtyOnChange: true });
+	};
+
+	const formatPlanStatusMessage = (): string => {
+		if (state.mode !== "planning" || !state.planFilePath) {
+			return "Plan mode: OFF";
+		}
+
+		return [
+			"Plan mode: ON",
+			`Plan file: ${state.planFilePath}`,
+			`Task: ${state.taskSummary ?? "waiting for task prompt"}`,
+			`Status: ${getPlanDisplayStatus(state)}`,
+			`Needs sync: ${state.planNeedsSync ? "yes" : "no"}`,
+		].join("\n");
+	};
+
+	async function activatePlanMode(
 		ctx: ExtensionContext,
 		options: {
 			reason?: string;
@@ -95,16 +280,22 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 			requireApproval: boolean;
 		},
 	): Promise<{ ok: boolean; message: string }> {
+		const normalizedTaskSummary = normalizeTaskSummary(options.taskSummary);
+
 		if (state.mode === "planning" && state.planFilePath) {
+			if (!state.taskSummary && normalizedTaskSummary) {
+				await seedTaskSummary(ctx, normalizedTaskSummary);
+			}
+
 			updatePlanModeUi(ctx, state);
 			return {
 				ok: true,
-				message: buildPlanningInstructionMessage(state.planFilePath),
+				message: buildPlanningInstructionMessage(state.planFilePath, state.taskSummary),
 			};
 		}
 
 		if (options.requireApproval) {
-			const approved = await confirmEnterPlanMode(ctx, options.reason, options.taskSummary);
+			const approved = await confirmEnterPlanMode(ctx, options.reason, normalizedTaskSummary);
 			if (!approved) {
 				return { ok: false, message: "User declined entering plan mode." };
 			}
@@ -112,11 +303,20 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 
 		restoreTools = pi.getActiveTools().length > 0 ? [...pi.getActiveTools()] : getAllToolNames(pi);
 		const planFilePath = createPlanFilePath();
-		await ensurePlanFileExists(planFilePath);
-		state = { mode: "planning", planFilePath };
+		const initialContent = await ensurePlanFileExists(planFilePath, normalizedTaskSummary);
+		const initialAnalysis = analyzePlanFileContent(initialContent);
+
+		commitState(ctx, {
+			mode: "planning",
+			planFilePath,
+			taskSummary: normalizedTaskSummary,
+			planStatus: initialAnalysis.status,
+			planNeedsSync: false,
+			lastPlanHash: initialAnalysis.hash,
+			lastEvidenceSource: undefined,
+		});
+		planningIntroPending = !options.requireApproval;
 		pi.setActiveTools(getPlanningTools(pi));
-		persistState(pi, state);
-		updatePlanModeUi(ctx, state);
 
 		if (ctx.hasUI) {
 			ctx.ui.notify(`Plan mode enabled. Plan file: ${planFilePath}`, "info");
@@ -124,19 +324,18 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 
 		return {
 			ok: true,
-			message: buildPlanningInstructionMessage(planFilePath),
+			message: buildPlanningInstructionMessage(planFilePath, normalizedTaskSummary),
 		};
 	}
 
-	function exitPlanMode(
+	function deactivatePlanMode(
 		ctx: ExtensionContext,
 		options: { notify?: string },
 	): { ok: boolean; message: string } {
-		state = createDefaultState();
 		pi.setActiveTools(getNormalTools(pi, restoreTools));
 		restoreTools = null;
-		persistState(pi, state);
-		updatePlanModeUi(ctx, state);
+		planningIntroPending = false;
+		commitState(ctx, createDefaultState());
 
 		if (ctx.hasUI && options.notify) {
 			ctx.ui.notify(options.notify, "info");
@@ -152,11 +351,11 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 		promptSnippet:
 			"enter_plan_mode: request approval to switch into planning mode before implementing a complex coding task.",
 		promptGuidelines: [
-			"After enter_plan_mode succeeds, treat the active plan file as the source of truth and update it before finishing your response.",
+			"After enter_plan_mode succeeds, the active plan file becomes the source of truth for the rest of plan mode.",
 		],
 		parameters: ENTER_PLAN_MODE_PARAMS,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const result = await enterPlanMode(ctx, {
+			const result = await activatePlanMode(ctx, {
 				reason: params.reason,
 				taskSummary: params.taskSummary,
 				requireApproval: true,
@@ -167,6 +366,7 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 					ok: result.ok,
 					mode: state.mode,
 					planFilePath: state.planFilePath,
+					taskSummary: state.taskSummary,
 				},
 			};
 		},
@@ -179,8 +379,8 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 		promptSnippet:
 			"exit_plan_mode: request approval to leave planning mode only after the active plan file is ready for user review.",
 		promptGuidelines: [
-			"Do not call exit_plan_mode until the active plan file contains a meaningful implementation plan.",
-			"If anything important is still unresolved, use ask_user_question first and continue refining the active plan file.",
+			"Do not call exit_plan_mode until the active plan file exists and reflects the latest evidence or user answers.",
+			"If anything important is still unresolved, use ask_user_question first and update the active plan file.",
 		],
 		parameters: EXIT_PLAN_MODE_PARAMS,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
@@ -191,38 +391,65 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 				};
 			}
 
-			let planContent = "";
-			try {
-				planContent = await readPlanFile(state.planFilePath);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+			const planContent = await refreshPlanStateFromFile(ctx);
+			if (!planContent) {
 				return {
-					content: [{ type: "text", text: `Cannot read the plan file yet: ${message}` }],
+					content: [{ type: "text", text: "Cannot read the active plan file yet." }],
 					details: { ok: false, planFilePath: state.planFilePath },
 				};
 			}
 
-			if (!isValidPlanFileContent(planContent)) {
+			if (state.planStatus !== "ready") {
 				return {
 					content: [
 						{
 							type: "text",
-							text: "The plan file is still missing or too short. Write a meaningful implementation plan before leaving plan mode.",
+							text: "Plan is still draft.",
 						},
 					],
-					details: { ok: false, planFilePath: state.planFilePath },
+					details: { ok: false, planFilePath: state.planFilePath, planStatus: state.planStatus },
+				};
+			}
+
+			if (state.planNeedsSync) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "Plan is stale. Sync the latest evidence first.",
+						},
+					],
+					details: {
+						ok: false,
+						planFilePath: state.planFilePath,
+						planNeedsSync: state.planNeedsSync,
+						lastEvidenceSource: state.lastEvidenceSource,
+					},
 				};
 			}
 
 			const exitChoice = await confirmExitPlanMode(ctx, state.planFilePath, planContent);
-			if (exitChoice !== "approve") {
+			if (exitChoice.action === "feedback") {
+				markPlanDirty(ctx, "exit_plan_mode feedback");
 				return {
-					content: [{ type: "text", text: "The user chose to continue planning. Keep refining the plan." }],
+					content: [{ type: "text", text: `User feedback: ${exitChoice.feedback}` }],
+					details: {
+						ok: false,
+						planFilePath: state.planFilePath,
+						feedback: exitChoice.feedback,
+						continuePlanning: true,
+					},
+				};
+			}
+
+			if (exitChoice.action !== "approve") {
+				return {
+					content: [{ type: "text", text: "The user did not approve leaving plan mode yet." }],
 					details: { ok: false, planFilePath: state.planFilePath },
 				};
 			}
 
-			exitPlanMode(ctx, { notify: "Plan mode disabled. The plan was approved." });
+			deactivatePlanMode(ctx, { notify: "Plan mode disabled. The plan was approved." });
 			return {
 				content: [{ type: "text", text: "Plan mode disabled. The user approved the written plan." }],
 				details: { ok: true, mode: state.mode },
@@ -262,6 +489,10 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 				};
 			}
 
+			if (state.mode === "planning") {
+				markPlanDirty(ctx, `ask_user_question: ${params.question.trim()}`);
+			}
+
 			return {
 				content: [{ type: "text", text: `User answer: ${answer}` }],
 				details: { ok: true, answer },
@@ -275,36 +506,32 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 			const raw = args.trim();
 			if (raw.length === 0) {
 				if (state.mode === "planning") {
-					exitPlanMode(ctx, { notify: "Plan mode disabled by user command." });
+					deactivatePlanMode(ctx, { notify: "Plan mode disabled by user command." });
 				} else {
-					await enterPlanMode(ctx, { requireApproval: false });
+					await activatePlanMode(ctx, { requireApproval: false });
 				}
 				return;
 			}
 
 			const normalized = raw.toLowerCase();
 			if (["on", "enable", "start"].includes(normalized)) {
-				await enterPlanMode(ctx, { requireApproval: false });
+				await activatePlanMode(ctx, { requireApproval: false });
 				return;
 			}
 
 			if (["off", "disable", "stop", "exit"].includes(normalized)) {
-				exitPlanMode(ctx, { notify: "Plan mode disabled by user command." });
+				deactivatePlanMode(ctx, { notify: "Plan mode disabled by user command." });
 				return;
 			}
 
 			if (["status", "state"].includes(normalized)) {
-				const message =
-					state.mode === "planning" && state.planFilePath
-						? `Plan mode: ON\nPlan file: ${state.planFilePath}`
-						: "Plan mode: OFF";
 				if (ctx.hasUI) {
-					ctx.ui.notify(message, "info");
+					ctx.ui.notify(formatPlanStatusMessage(), "info");
 				}
 				return;
 			}
 
-			const result = await enterPlanMode(ctx, {
+			const result = await activatePlanMode(ctx, {
 				requireApproval: false,
 				taskSummary: raw,
 			});
@@ -314,24 +541,26 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 		},
 	});
 
-	pi.on("before_agent_start", async (event) => {
-		if (state.mode !== "planning" || !state.planFilePath) {
+	pi.on("input", async (event: InputEvent, ctx) => {
+		if (state.mode !== "planning" || state.taskSummary || event.source === "extension") {
 			return;
 		}
 
-		let extraReminder = "";
-		try {
-			const currentPlan = await readPlanFile(state.planFilePath);
-			if (!isValidPlanFileContent(currentPlan)) {
-				extraReminder =
-					"\n\nReminder: the active plan file still does not contain a meaningful plan. Update the active plan file during this run before finishing your response.";
-			}
-		} catch {
-			extraReminder =
-				"\n\nReminder: the active plan file is missing or unreadable. Recreate or update it before finishing your response.";
+		const text = event.text.trim();
+		if (text.length === 0 || text.startsWith("/")) {
+			return;
 		}
 
-		const planPrompt = `${planModePrompt}\n\nCurrent plan file: ${state.planFilePath}${extraReminder}`;
+		await seedTaskSummary(ctx, text);
+	});
+
+	pi.on("before_agent_start", async (event) => {
+		if (state.mode !== "planning" || !state.planFilePath || !planningIntroPending) {
+			return;
+		}
+
+		planningIntroPending = false;
+		const planPrompt = `${planModePrompt}\n\n${buildPlanModeIntroText(state)}`;
 		return {
 			systemPrompt: `${event.systemPrompt}\n\n${planPrompt}`,
 		};
@@ -367,12 +596,35 @@ export default async function planModePackage(pi: ExtensionAPI): Promise<void> {
 		}
 	});
 
+	pi.on("tool_result", async (event: ToolResultEvent, ctx) => {
+		if (state.mode !== "planning" || event.isError) {
+			return;
+		}
+
+		if (
+			(event.toolName === "write" || event.toolName === "edit") &&
+			isPlanFileWriteAllowed(event.toolName, event.input, state.planFilePath, ctx.cwd)
+		) {
+			await refreshPlanStateFromFile(ctx, { clearDirtyOnChange: true });
+			return;
+		}
+
+		if (DIRTY_EVIDENCE_TOOLS.has(event.toolName)) {
+			if (isSamePlanFilePath(event.input, state.planFilePath, ctx.cwd)) {
+				return;
+			}
+			markPlanDirty(ctx, describeEvidenceSource(event.toolName, event.input));
+		}
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		state = restoreStateFromSession(ctx.sessionManager);
 		restoreTools = pi.getActiveTools().length > 0 ? [...pi.getActiveTools()] : getAllToolNames(pi);
 
 		if (state.mode === "planning") {
+			planningIntroPending = true;
 			pi.setActiveTools(getPlanningTools(pi));
+			await refreshPlanStateFromFile(ctx);
 		}
 
 		updatePlanModeUi(ctx, state);

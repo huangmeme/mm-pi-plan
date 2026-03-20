@@ -1,10 +1,39 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, truncateToWidth } from "@mariozechner/pi-tui";
-import { basename, relative } from "node:path";
-import type { PlanSessionState } from "./state.js";
-import { PLAN_MODE_STATUS_KEY, PLAN_MODE_WIDGET_KEY } from "./state.js";
+import { PLAN_MODE_STATUS_KEY, PLAN_MODE_WIDGET_KEY, type PlanSessionState } from "./state.js";
 
-export type ExitPlanModeChoice = "approve" | "continue_planning";
+export type ExitPlanModeChoice =
+	| { action: "approve" }
+	| { action: "feedback"; feedback: string }
+	| { action: "cancel" };
+
+interface InlineQuestionPromptOptions {
+	title: string;
+	question: string;
+	questionTitle?: string;
+	context?: string;
+	contextTitle?: string;
+	options?: string[];
+	showOptionsHeader?: boolean;
+	customAnswerEnabled?: boolean;
+	customAnswerLabel: string;
+	customAnswerKind: "answer" | "note";
+}
+
+export interface EnterPlanPromptConfig {
+	title: string;
+	question: string;
+	context?: string;
+	options: string[];
+	showOptionsHeader: boolean;
+	customAnswerEnabled: boolean;
+	customAnswerLabel: string;
+	customAnswerKind: "answer" | "note";
+}
+
+let lastRenderedPlanStatus: string | undefined;
+let planWidgetCleared = false;
+const INLINE_NOTE_SEPARATOR = "  : ";
 
 function wrapText(text: string, width: number): string[] {
 	if (width <= 0) {
@@ -32,10 +61,53 @@ function wrapText(text: string, width: number): string[] {
 	return lines;
 }
 
+function normalizeInlineNote(input: string): string {
+	return input.replace(/\s+/g, " ").trim();
+}
+
+function buildInlineNoteLabel(
+	baseLabel: string,
+	note: string,
+	isEditing: boolean,
+	maxLength: number,
+): string {
+	const normalized = normalizeInlineNote(note);
+	if (normalized.length === 0 && !isEditing) {
+		return baseLabel;
+	}
+
+	const suffix = isEditing ? `${normalized}|` : normalized;
+	const inline = `${baseLabel}${INLINE_NOTE_SEPARATOR}${suffix}`;
+	if (inline.length <= maxLength) {
+		return inline;
+	}
+
+	if (maxLength <= 1) {
+		return ".";
+	}
+
+	return `${inline.slice(0, maxLength - 1)}.`;
+}
+
+function createEditorTheme(theme: {
+	fg: (color: "accent" | "muted" | "dim" | "warning" | "text", text: string) => string;
+}): EditorTheme {
+	return {
+		borderColor: (text) => theme.fg("accent", text),
+		selectList: {
+			selectedPrefix: (text) => theme.fg("accent", text),
+			selectedText: (text) => theme.fg("accent", text),
+			description: (text) => theme.fg("muted", text),
+			scrollInfo: (text) => theme.fg("dim", text),
+			noMatch: (text) => theme.fg("warning", text),
+		},
+	};
+}
+
 export function normalizeQuestionOption(option: string): string {
 	return option
-		.replace(/^\s*[-*•]\s+/, "")
-		.replace(/^\s*\d+[.)、:：-]\s*/, "")
+		.replace(/^\s*[-*+]\s+/, "")
+		.replace(/^\s*\d+[.):-]\s*/, "")
 		.replace(/\s+/g, " ")
 		.trim();
 }
@@ -81,17 +153,17 @@ export function getAtomicQuestionViolation(question: string): string | undefined
 		return "Ask only one atomic question per ask_user_question call. Move extra detail into context or split the questions.";
 	}
 
-	const questionMarkCount = (normalized.match(/[?？]/g) ?? []).length;
+	const questionMarkCount = (normalized.match(/\?/g) ?? []).length;
 	if (questionMarkCount > 1) {
 		return "The question appears to contain multiple questions. Split it into separate ask_user_question calls.";
 	}
 
-	const numberedSegments = normalized.match(/(?:^|\s)\d+[.)、:：-]\s+/g) ?? [];
+	const numberedSegments = normalized.match(/(?:^|\s)\d+[.):-]\s+/g) ?? [];
 	if (numberedSegments.length > 1) {
 		return "Do not send numbered sub-questions in one ask_user_question call. Ask them separately.";
 	}
 
-	const bulletSegments = normalized.match(/(?:^|\s)[-*•]\s+\S+/g) ?? [];
+	const bulletSegments = normalized.match(/(?:^|\s)[-*+]\s+\S+/g) ?? [];
 	if (bulletSegments.length > 1) {
 		return "Do not bundle multiple bullet-point questions into one ask_user_question call. Split them up.";
 	}
@@ -99,91 +171,126 @@ export function getAtomicQuestionViolation(question: string): string | undefined
 	return undefined;
 }
 
+export function buildEnterPlanPurpose(reason?: string, taskSummary?: string): string | undefined {
+	const normalizedTaskSummary = taskSummary?.trim();
+	const normalizedReason = reason?.trim();
+
+	if (normalizedTaskSummary && normalizedReason) {
+		if (normalizedTaskSummary === normalizedReason) {
+			return normalizedTaskSummary;
+		}
+
+		return `${normalizedTaskSummary}. ${normalizedReason}`;
+	}
+
+	return normalizedTaskSummary ?? normalizedReason;
+}
+
+export function createEnterPlanPrompt(reason?: string, taskSummary?: string): EnterPlanPromptConfig {
+	const purpose = buildEnterPlanPurpose(reason, taskSummary);
+	return {
+		title: "Enter Plan Mode",
+		question: "Allow the agent to enter plan mode?",
+		context: purpose ? `Purpose: ${purpose}` : undefined,
+		options: ["Yes", "No"],
+		showOptionsHeader: false,
+		customAnswerEnabled: false,
+		customAnswerLabel: "",
+		customAnswerKind: "note",
+	};
+}
+
 export async function confirmEnterPlanMode(
 	ctx: ExtensionContext,
 	reason?: string,
 	taskSummary?: string,
 ): Promise<boolean> {
-	if (!ctx.hasUI) {
-		return false;
-	}
-
-	const parts = [
-		"Allow the agent to enter plan mode?",
-		reason ? `Reason: ${reason}` : undefined,
-		taskSummary ? `Task: ${taskSummary}` : undefined,
-	]
-		.filter(Boolean)
-		.join("\n\n");
-
-	return ctx.ui.confirm("Enter Plan Mode", parts);
+	const answer = await askInlineQuestion(ctx, createEnterPlanPrompt(reason, taskSummary));
+	return answer === "Yes";
 }
 
 export async function confirmExitPlanMode(
 	ctx: ExtensionContext,
 	planFilePath: string,
-	planContent: string,
+	_planContent: string,
 ): Promise<ExitPlanModeChoice> {
-	if (!ctx.hasUI) {
-		return "continue_planning";
+	const answer = await askInlineQuestion(ctx, {
+		title: "Exit plan mode",
+		question: "Allow the agent to exit plan mode?",
+		context: `Plan file: ${planFilePath}`,
+		options: ["Approve and exit plan mode"],
+		showOptionsHeader: false,
+		customAnswerEnabled: true,
+		customAnswerLabel: "Add feedback and continue",
+		customAnswerKind: "note",
+	});
+
+	if (!answer) {
+		return { action: "cancel" };
 	}
 
-	const preview = planContent.length > 1600 ? `${planContent.slice(0, 1600)}\n\n...[truncated]` : planContent;
-	const message = [`Allow the agent to exit plan mode?`, `Plan file: ${planFilePath}`, "", preview].join("\n");
-	const choice = await ctx.ui.select(message, ["Approve and exit plan mode", "Continue planning"]);
-	return choice === "Approve and exit plan mode" ? "approve" : "continue_planning";
+	if (answer === "Approve and exit plan mode") {
+		return { action: "approve" };
+	}
+
+	return { action: "feedback", feedback: answer };
 }
 
-export async function askUserQuestion(
+async function askInlineQuestion(
 	ctx: ExtensionContext,
-	question: string,
-	context?: string,
-	options?: string[],
+	prompt: InlineQuestionPromptOptions,
 ): Promise<string | undefined> {
 	if (!ctx.hasUI) {
 		return undefined;
 	}
 
-	const normalizedQuestion = question.trim();
-	const normalizedContext = context?.trim() ?? "";
-	const normalizedOptions = normalizeQuestionOptions(options);
+	const normalizedQuestion = prompt.question.trim();
+	const normalizedContext = prompt.context?.trim() ?? "";
+	const normalizedOptions = normalizeQuestionOptions(prompt.options);
+	const customAnswerEnabled = prompt.customAnswerEnabled !== false;
+	const showOptionsHeader = prompt.showOptionsHeader !== false;
 
 	return ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
 		let optionIndex = 0;
-		let editMode = normalizedOptions.length === 0;
+		let editMode = false;
+		let customAnswer = "";
 		let cachedLines: string[] | undefined;
 
-		const editorTheme: EditorTheme = {
-			borderColor: (text) => theme.fg("accent", text),
-			selectList: {
-				selectedPrefix: (text) => theme.fg("accent", text),
-				selectedText: (text) => theme.fg("accent", text),
-				description: (text) => theme.fg("muted", text),
-				scrollInfo: (text) => theme.fg("dim", text),
-				noMatch: (text) => theme.fg("warning", text),
-			},
-		};
-		const editor = new Editor(tui, editorTheme);
+		const editor = new Editor(tui, createEditorTheme(theme));
+		const customOptionIndex = customAnswerEnabled ? normalizedOptions.length : -1;
+		const maxOptionIndex = customAnswerEnabled ? customOptionIndex : Math.max(0, normalizedOptions.length - 1);
 
 		const requestRerender = () => {
 			cachedLines = undefined;
 			tui.requestRender();
 		};
 
+		const getNormalizedCustomAnswer = (): string => normalizeInlineNote(customAnswer);
+
+		const openCustomAnswerEditor = () => {
+			if (!customAnswerEnabled || optionIndex !== customOptionIndex) {
+				return;
+			}
+
+			editMode = true;
+			editor.setText(customAnswer);
+			requestRerender();
+		};
+
+		editor.onChange = (value) => {
+			customAnswer = value;
+			requestRerender();
+		};
+
 		editor.onSubmit = (value) => {
-			const trimmed = value.trim();
+			customAnswer = value;
+			const trimmed = getNormalizedCustomAnswer();
 			if (trimmed.length > 0) {
 				done(trimmed);
 				return;
 			}
 
-			if (normalizedOptions.length === 0) {
-				done(undefined);
-				return;
-			}
-
 			editMode = false;
-			editor.setText("");
 			requestRerender();
 		};
 
@@ -202,14 +309,8 @@ export async function askUserQuestion(
 
 		const handleInput = (data: string) => {
 			if (editMode) {
-				if (matchesKey(data, Key.escape)) {
-					if (normalizedOptions.length === 0) {
-						done(undefined);
-						return;
-					}
-
+				if (matchesKey(data, Key.tab) || matchesKey(data, Key.escape)) {
 					editMode = false;
-					editor.setText("");
 					requestRerender();
 					return;
 				}
@@ -226,15 +327,27 @@ export async function askUserQuestion(
 			}
 
 			if (matchesKey(data, Key.down)) {
-				optionIndex = Math.min(normalizedOptions.length, optionIndex + 1);
+				optionIndex = Math.min(maxOptionIndex, optionIndex + 1);
 				requestRerender();
 				return;
 			}
 
+			if (matchesKey(data, Key.tab)) {
+				if (customAnswerEnabled && optionIndex === customOptionIndex) {
+					openCustomAnswerEditor();
+				}
+				return;
+			}
+
 			if (matchesKey(data, Key.enter)) {
-				if (optionIndex === normalizedOptions.length) {
-					editMode = true;
-					requestRerender();
+				if (customAnswerEnabled && optionIndex === customOptionIndex) {
+					const customAnswerValue = getNormalizedCustomAnswer();
+					if (customAnswerValue.length > 0) {
+						done(customAnswerValue);
+						return;
+					}
+
+					openCustomAnswerEditor();
 					return;
 				}
 
@@ -244,6 +357,13 @@ export async function askUserQuestion(
 
 			if (matchesKey(data, Key.escape)) {
 				done(undefined);
+				return;
+			}
+
+			if (customAnswerEnabled && optionIndex === customOptionIndex && data.length > 0) {
+				openCustomAnswerEditor();
+				editor.handleInput(data);
+				requestRerender();
 			}
 		};
 
@@ -253,54 +373,89 @@ export async function askUserQuestion(
 			}
 
 			const lines: string[] = [];
+			const selectedPrefix = theme.fg("accent", ">  ");
+			const unselectedPrefix = "   ";
 			lines.push(truncateToWidth(theme.fg("accent", "-".repeat(width)), width));
-			renderSection(lines, width, "Question", normalizedQuestion);
+			lines.push(truncateToWidth(theme.fg("text", ` ${prompt.title}`), width));
+			lines.push("");
+
+			if (prompt.questionTitle) {
+				renderSection(lines, width, prompt.questionTitle, normalizedQuestion);
+			} else {
+				for (const line of wrapText(normalizedQuestion, Math.max(10, width - 2))) {
+					lines.push(truncateToWidth(theme.fg("text", line), width));
+				}
+			}
 
 			if (normalizedContext.length > 0) {
 				lines.push("");
-				renderSection(lines, width, "Context", normalizedContext, "muted");
+				if (prompt.contextTitle) {
+					renderSection(lines, width, prompt.contextTitle, normalizedContext, "muted");
+				} else {
+					for (const line of wrapText(normalizedContext, Math.max(10, width - 2))) {
+						lines.push(truncateToWidth(theme.fg("muted", line), width));
+					}
+				}
 			}
 
-			if (normalizedOptions.length > 0) {
-				lines.push("");
+			lines.push("");
+			if (showOptionsHeader) {
 				lines.push(truncateToWidth(theme.fg("accent", "Options"), width));
-				for (let index = 0; index < normalizedOptions.length; index += 1) {
-					const isSelected = !editMode && index === optionIndex;
-					const prefix = isSelected ? theme.fg("accent", "> ") : "  ";
-					const optionText = `${index + 1}. ${normalizedOptions[index]}`;
-					lines.push(
-						truncateToWidth(
-							`${prefix}${isSelected ? theme.fg("accent", optionText) : theme.fg("text", optionText)}`,
-							width,
-						),
-					);
-				}
-
-				const customIndex = normalizedOptions.length;
-				const isCustomSelected = !editMode && optionIndex === customIndex;
-				const customPrefix = isCustomSelected ? theme.fg("accent", "> ") : "  ";
-				const customLabel = "Type a custom answer";
+			}
+			for (let index = 0; index < normalizedOptions.length; index += 1) {
+				const isSelected = !editMode && index === optionIndex;
+				const prefix = isSelected ? selectedPrefix : unselectedPrefix;
+				const optionText = normalizedOptions[index];
 				lines.push(
 					truncateToWidth(
-						`${customPrefix}${isCustomSelected ? theme.fg("accent", customLabel) : theme.fg("text", customLabel)}`,
+						`${prefix}${isSelected ? theme.fg("accent", optionText) : theme.fg("text", optionText)}`,
 						width,
 					),
 				);
 			}
 
-			if (editMode) {
-				lines.push("");
-				lines.push(truncateToWidth(theme.fg("accent", "Your answer"), width));
-				for (const line of editor.render(Math.max(10, width - 2))) {
-					lines.push(truncateToWidth(` ${line}`, width));
-				}
+			if (customAnswerEnabled) {
+				const isCustomSelected = optionIndex === customOptionIndex;
+				const customLabel = buildInlineNoteLabel(
+					prompt.customAnswerLabel,
+					customAnswer,
+					editMode && isCustomSelected,
+					Math.max(20, width - 8),
+				);
+				lines.push(
+					truncateToWidth(
+						`${isCustomSelected ? selectedPrefix : unselectedPrefix}${theme.fg(isCustomSelected ? "accent" : "text", customLabel)}`,
+						width,
+					),
+				);
 			}
 
 			lines.push("");
 			if (editMode) {
-				lines.push(truncateToWidth(theme.fg("dim", "Enter submit  Esc back/cancel"), width));
+				lines.push(
+					truncateToWidth(
+						theme.fg("dim", `Typing ${prompt.customAnswerKind} inline | Enter submit | Tab/Esc stop editing`),
+						width,
+					),
+				);
+			} else if (customAnswerEnabled && optionIndex === customOptionIndex) {
+				if (getNormalizedCustomAnswer().length > 0) {
+					lines.push(
+						truncateToWidth(
+							theme.fg("dim", `Up/Down move | Enter submit | Type/Tab edit ${prompt.customAnswerKind} | Esc cancel`),
+							width,
+						),
+					);
+				} else {
+					lines.push(
+						truncateToWidth(
+							theme.fg("dim", `Up/Down move | Enter add ${prompt.customAnswerKind} | Type/Tab edit ${prompt.customAnswerKind} | Esc cancel`),
+							width,
+						),
+					);
+				}
 			} else {
-				lines.push(truncateToWidth(theme.fg("dim", "Up/Down navigate  Enter select  Esc cancel"), width));
+				lines.push(truncateToWidth(theme.fg("dim", "Up/Down move | Enter select | Esc cancel"), width));
 			}
 			lines.push(truncateToWidth(theme.fg("accent", "-".repeat(width)), width));
 
@@ -318,23 +473,54 @@ export async function askUserQuestion(
 	});
 }
 
+export async function askUserQuestion(
+	ctx: ExtensionContext,
+	question: string,
+	context?: string,
+	options?: string[],
+): Promise<string | undefined> {
+	return askInlineQuestion(ctx, {
+		title: "Ask user question",
+		question,
+		questionTitle: "Question",
+		context,
+		contextTitle: context ? "Context" : undefined,
+		options,
+		showOptionsHeader: true,
+		customAnswerEnabled: true,
+		customAnswerLabel: options && options.length > 0 ? "Type a custom answer" : "Type your answer",
+		customAnswerKind: "answer",
+	});
+}
+
 export function updatePlanModeUi(ctx: ExtensionContext, state: PlanSessionState): void {
 	if (!ctx.hasUI) {
 		return;
 	}
 
 	if (state.mode !== "planning" || !state.planFilePath) {
-		ctx.ui.setStatus(PLAN_MODE_STATUS_KEY, undefined);
-		ctx.ui.setWidget(PLAN_MODE_WIDGET_KEY, undefined);
+		if (lastRenderedPlanStatus !== undefined) {
+			ctx.ui.setStatus(PLAN_MODE_STATUS_KEY, undefined);
+			lastRenderedPlanStatus = undefined;
+		}
+		if (!planWidgetCleared) {
+			ctx.ui.setWidget(PLAN_MODE_WIDGET_KEY, undefined);
+			planWidgetCleared = true;
+		}
 		return;
 	}
 
-	const relativePath = relative(ctx.cwd, state.planFilePath) || basename(state.planFilePath);
-	ctx.ui.setStatus(PLAN_MODE_STATUS_KEY, ctx.ui.theme.fg("warning", "plan"));
-	ctx.ui.setWidget(PLAN_MODE_WIDGET_KEY, [
-		ctx.ui.theme.fg("accent", "Plan mode active"),
-		ctx.ui.theme.fg("muted", `Plan file: ${relativePath}`),
-	]);
+	const renderedStatus = ctx.ui.theme.fg("accent", "Plan");
+
+	if (renderedStatus !== lastRenderedPlanStatus) {
+		ctx.ui.setStatus(PLAN_MODE_STATUS_KEY, renderedStatus);
+		lastRenderedPlanStatus = renderedStatus;
+	}
+
+	if (!planWidgetCleared) {
+		ctx.ui.setWidget(PLAN_MODE_WIDGET_KEY, undefined);
+		planWidgetCleared = true;
+	}
 }
 
 export function notifyWarnings(ctx: ExtensionContext, warnings: string[]): void {

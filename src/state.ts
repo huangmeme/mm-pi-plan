@@ -7,15 +7,27 @@ export const PLAN_MODE_STATUS_KEY = "mm-pi-plan";
 export const PLAN_MODE_WIDGET_KEY = "mm-pi-plan-widget";
 
 export type PlanMode = "normal" | "planning";
+export type PlanStatus = "empty" | "draft" | "ready";
+export type PlanDisplayStatus = "empty" | "draft" | "stale" | "ready";
 
 export interface PlanSessionState {
 	mode: PlanMode;
 	planFilePath?: string;
+	taskSummary?: string;
+	planStatus: PlanStatus;
+	planNeedsSync: boolean;
+	lastPlanHash?: string;
+	lastEvidenceSource?: string;
 }
 
 export interface PlanStateEntry {
 	mode: PlanMode;
 	planFilePath?: string;
+	taskSummary?: string;
+	planStatus?: PlanStatus;
+	planNeedsSync?: boolean;
+	lastPlanHash?: string;
+	lastEvidenceSource?: string;
 }
 
 interface SessionEntryReader {
@@ -49,14 +61,35 @@ const PLAN_NOUNS = [
 ] as const;
 
 export function createDefaultState(): PlanSessionState {
-	return { mode: "normal" };
+	return {
+		mode: "normal",
+		planStatus: "empty",
+		planNeedsSync: false,
+	};
 }
 
 export function createPlanStateEntry(state: PlanSessionState): PlanStateEntry {
 	return {
 		mode: state.mode,
 		planFilePath: state.planFilePath,
+		taskSummary: state.taskSummary,
+		planStatus: state.planStatus,
+		planNeedsSync: state.planNeedsSync,
+		lastPlanHash: state.lastPlanHash,
+		lastEvidenceSource: state.lastEvidenceSource,
 	};
+}
+
+export function getPlanDisplayStatus(state: PlanSessionState): PlanDisplayStatus {
+	if (state.planStatus === "empty") {
+		return "empty";
+	}
+
+	if (state.planNeedsSync) {
+		return "stale";
+	}
+
+	return state.planStatus;
 }
 
 export function createFunPlanFileName(
@@ -91,6 +124,15 @@ export function restoreStateFromSession(sessionManager: SessionEntryReader): Pla
 		return {
 			mode: entry.data.mode === "planning" ? "planning" : "normal",
 			planFilePath: entry.data.planFilePath,
+			taskSummary: typeof entry.data.taskSummary === "string" ? entry.data.taskSummary : undefined,
+			planStatus:
+				entry.data.planStatus === "draft" || entry.data.planStatus === "ready" || entry.data.planStatus === "empty"
+					? entry.data.planStatus
+					: "empty",
+			planNeedsSync: entry.data.planNeedsSync === true,
+			lastPlanHash: typeof entry.data.lastPlanHash === "string" ? entry.data.lastPlanHash : undefined,
+			lastEvidenceSource:
+				typeof entry.data.lastEvidenceSource === "string" ? entry.data.lastEvidenceSource : undefined,
 		};
 	}
 

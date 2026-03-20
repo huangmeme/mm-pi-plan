@@ -10,6 +10,8 @@ This is a general-purpose clarification tool and is not limited to Plan Mode.
 Behavior:
 - This tool asks the user one focused question.
 - You may provide answer options when they help narrow the decision.
+- In the TUI, options are shown as a compact action list and custom answers are edited inline.
+- This same ask-style UI is also reused by exit_plan_mode when the user must approve exit or leave feedback.
 - The answer should be used to remove ambiguity, confirm direction, or unblock the next decision.
 - In Plan Mode, it is especially useful before calling exit_plan_mode.
 

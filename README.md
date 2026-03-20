@@ -13,6 +13,13 @@ While planning:
 - the agent can inspect the codebase
 - the agent can use search, read, LSP, and web tools when available
 - the agent may only write to the generated plan file
+- the generated plan file starts with a lightweight reference template, not a rigid schema
+- the model may adapt, reorder, or replace that template if another structure communicates the plan better
+- the planning prompt pushes the model toward evidence gathered, assumptions, concrete plan steps, validation, and risks
+- the agent is expected to keep that active plan file updated as research and planning progress, not only at exit time
+- if planning starts without a task summary, the first real user task prompt becomes the active task summary
+- new evidence or user answers can mark the plan as stale until they are synced into the plan file
+- once the active plan file exists, it counts as the plan artifact even if it is still rough
 - the agent cannot use `bash`
 - the generated plan file is created under the user's home directory in `.pi/plans/` with a fun random name like `mint-panda-a8f3.md`
 
@@ -54,6 +61,8 @@ pi -e ./src/index.ts
 - `/plan off`
 - `/plan status`
 - `/plan <task>`
+
+`/plan status` shows the current plan file path, task summary, display status, and whether the plan still needs sync.
 
 ## Development
 

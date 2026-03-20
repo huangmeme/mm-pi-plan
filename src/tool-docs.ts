@@ -14,13 +14,13 @@ const DEFAULT_DOCS: Record<ToolDocName, string> = {
 	enter_plan_mode:
 		"Request user approval to enter plan mode before planning a code-writing task.",
 	exit_plan_mode:
-		"Request user approval to exit plan mode after writing the implementation plan to the plan file.",
+		"Request user approval to exit plan mode after the active plan file exists and is up to date.",
 	ask_user_question:
-		"Ask the user a clarifying question during plan mode when important requirements are unresolved.",
+		"Ask the user a focused clarifying question when important requirements or tradeoffs are unresolved.",
 };
 
 const DEFAULT_PLAN_MODE_PROMPT = `
-[PLAN MODE ACTIVE]
+# Plan Mode
 You are in plan mode, which is a session state used before implementing a complex coding task.
 
 Rules:
@@ -28,8 +28,10 @@ Rules:
 - You may ask the user clarifying questions with ask_user_question.
 - Do not use bash in plan mode.
 - The only file you may modify is the plan file provided below.
-- Write the implementation plan into the plan file, not only into chat.
-- Only call exit_plan_mode after the plan file is written and you are ready for the user to approve it.
+- Maintain the implementation plan in that plan file as you work, not only at exit.
+- If plan mode starts without a task summary, treat the first real user task prompt as the task.
+- Sync new evidence and user answers back into the plan file before trying to exit.
+- Only call exit_plan_mode after the plan file exists and is up to date.
 - Do not call exit_plan_mode for pure research or codebase-understanding tasks.
 `.trim();
 

@@ -1,4 +1,5 @@
 import { posix, win32 } from "node:path";
+import { analyzePlanFileContent } from "./plan-file.js";
 
 export const PLAN_MODE_TOOL_CANDIDATES = [
 	"read",
@@ -37,8 +38,7 @@ export function getToolPath(input: unknown): string | undefined {
 	return typeof candidate.path === "string" ? candidate.path : undefined;
 }
 
-export function isPlanFileWriteAllowed(
-	toolName: string,
+export function isSamePlanFilePath(
 	input: unknown,
 	planFilePath: string | undefined,
 	cwd: string,
@@ -46,10 +46,6 @@ export function isPlanFileWriteAllowed(
 ): boolean {
 	if (!planFilePath) {
 		return false;
-	}
-
-	if (!isWriteLikeTool(toolName)) {
-		return true;
 	}
 
 	const targetPath = getToolPath(input);
@@ -68,24 +64,24 @@ export function isPlanFileWriteAllowed(
 	return normalizedTargetPath === normalizedPlanPath;
 }
 
-export function isValidPlanFileContent(content: string, minimumLength = 40): boolean {
-	const trimmed = content.trim();
-	if (trimmed.length < minimumLength) {
+export function isPlanFileWriteAllowed(
+	toolName: string,
+	input: unknown,
+	planFilePath: string | undefined,
+	cwd: string,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	if (!planFilePath) {
 		return false;
 	}
 
-	const meaningfulLines = trimmed
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter((line) => line.length > 0)
-		.filter((line) => !line.startsWith("#"))
-		.filter((line) => line.replace(/^[-*]\s+/, "").trim().length > 0)
-		.filter((line) => line.replace(/^\d+[.)]\s+/, "").trim().length > 0);
-
-	if (meaningfulLines.length < 2) {
-		return false;
+	if (!isWriteLikeTool(toolName)) {
+		return true;
 	}
 
-	const meaningfulLength = meaningfulLines.reduce((sum, line) => sum + line.length, 0);
-	return meaningfulLength >= 40;
+	return isSamePlanFilePath(input, planFilePath, cwd, platform);
+}
+
+export function isValidPlanFileContent(content: string): boolean {
+	return analyzePlanFileContent(content).isValid;
 }
